@@ -250,6 +250,16 @@ impl<Q: AttachGlobalEntrySink> GlobalEntrySink for Q {
     }
 }
 
+#[cfg(doc)]
+#[doc(hidden)]
+mod _doctest {
+    // test that the `global_entry_sink` macro works correctly in docs
+
+    use metrique_writer::sink::global_entry_sink;
+
+    global_entry_sink! { MyEntrySink }
+}
+
 /// Define a new global [`AttachGlobalEntrySink`] that can be referenced by type name in all threads.
 ///
 /// # Usage
@@ -441,7 +451,7 @@ macro_rules! global_entry_sink {
                         /// # Example
                         /// ```rust
                         /// # use metrique_writer::sink::global_entry_sink;
-                        /// # use metrique_writer::test_util::test_entry_sink;
+                        /// # use metrique_writer::test_util::{test_entry_sink, TestEntrySink};
                         /// # global_entry_sink! { TestSink }
                         /// let TestEntrySink { inspector, sink } = test_entry_sink();
                         ///
