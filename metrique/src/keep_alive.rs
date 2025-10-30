@@ -16,6 +16,9 @@ use core::{
     ops::{Deref, DerefMut, Drop},
 };
 use std::sync::{Arc, Mutex, Weak};
+
+use tokio::sync::futures::OwnedNotified;
+
 /// [`Parent`] owner
 ///
 /// The [`Parent`] provides exclusive mutable access to its inner value.
@@ -36,9 +39,57 @@ unsafe impl<T> Send for Parent<T> where T: Send {}
 /// Safety: If `T` is `Sync`, then `Arc<T>` is `Sync`
 unsafe impl<T> Sync for Parent<T> where T: Sync {}
 
+/// Drop all and notification
+#[pin_project::pin_project]
+pub struct DropAllAndNotification {
+    drop_all: DropAll,
+    #[pin]
+    notification: OptOwnedNotified,
+}
+
+impl std::future::Future for DropAllAndNotification {
+    type Output = ();
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        let mut this = self.project();
+        loop {
+            match this.notification.as_mut().project() {
+                // slightly weird pattern to pin on first use
+                OptOwnedNotifiedProj::Unset => {
+                    match this.drop_all.0.upgrade() {
+                        Some(guard) => guard.notify(this.notification.as_mut()),
+                        None => { this.notification.as_mut().set(OptOwnedNotified::Done); }
+                    }
+                }
+                OptOwnedNotifiedProj::Done => return std::task::Poll::Ready(()),
+                OptOwnedNotifiedProj::Notified(notified) => return notified.poll(cx)
+            }
+        }
+    }
+}
+
+#[pin_project::pin_project(project = OptOwnedNotifiedProj)]
+enum OptOwnedNotified {
+    Unset,
+    Done,
+    Notified(#[pin] tokio::sync::futures::OwnedNotified)
+}
+
 trait GuardInner: Send + Sync {
     fn destroy(&self);
+    fn notify(&self, notified: std::pin::Pin<&mut OptOwnedNotified<>>);
+}
 
+struct GuardInnerStruct<F: FnOnce() + Send + Sync> {
+    destroy: F,
+    notify: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl<F: FnOnce() + Send + Sync> GuardInnerStruct<F> {
+
+    fn new(f: F) -> Self {
+        Self { destroy: f, notify: None }
+    }
 }
 
 // Why all these layers?
@@ -47,10 +98,31 @@ trait GuardInner: Send + Sync {
 //
 // 1. Mutex: This is inside an Arc. We need to be able to take the function out of the
 // 2. Option: Allow taking ownership of the:
-impl<F: FnOnce() + Send + Sync> GuardInner for Mutex<Option<F>> {
+impl<F: FnOnce() + Send + Sync> GuardInner for Mutex<Option<GuardInnerStruct<F>>> {
     fn destroy(&self) {
-        if let Some(f) = self.lock().unwrap().take() {
-            (f)()
+        let mut guard = self.lock().unwrap();
+        if let Some(inner) = guard.take() {
+            (inner.destroy)();
+            if let Some(notify) = inner.notify {
+                notify.notify_waiters();
+            }
+        }
+    }
+
+    fn notify(&self, mut notified: std::pin::Pin<&mut OptOwnedNotified<>>) {
+        let mut guard = self.lock().unwrap();
+        if let Some(inner) = &mut *guard {
+            let notified_owned = inner.notify.get_or_insert_default().clone().notified_owned();
+            notified.as_mut().set(OptOwnedNotified::Notified(notified_owned));
+            if let OptOwnedNotifiedProj::Notified(notified_owned) = notified.project() {
+                // enable while the lock is held
+                notified_owned.enable();
+            } else {
+                unreachable!()
+            }
+
+        } else {
+            notified.set(OptOwnedNotified::Done);
         }
     }
 }
@@ -74,6 +146,13 @@ impl Drop for DropAll {
     }
 }
 
+impl DropAll {
+    /// With notification
+    pub fn with_notification(self) -> DropAllAndNotification {
+        DropAllAndNotification { drop_all: self, notification: OptOwnedNotified::Unset }
+    }
+}
+
 impl<T: Send + Sync + 'static> Parent<T> {
     pub(crate) fn new(value: T) -> Self {
         let value: Arc<UnsafeCell<T>> = Arc::new(value.into());
@@ -84,7 +163,7 @@ impl<T: Send + Sync + 'static> Parent<T> {
         unsafe impl<T> Sync for AssertSendSync<T> {}
         let guard_value = AssertSendSync(value.clone());
         let guard = Guard {
-            _value: Arc::new(Mutex::new(Some(|| drop(guard_value)))),
+            _value: Arc::new(Mutex::new(Some(GuardInnerStruct::new(|| drop(guard_value))))),
         };
         Self { value, guard }
     }
