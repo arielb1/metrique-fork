@@ -682,7 +682,6 @@ version = "0.1.6"
 dependencies = [
  "anyhow",
  "chrono",
- "futures",
  "itoa",
  "metrique",
  "metrique-core",
@@ -694,7 +693,6 @@ dependencies = [
  "metrique-writer-core",
  "metrique-writer-format-emf",
  "metrique-writer-macro",
- "pin-project",
  "rstest",
  "rustversion",
  "ryu",

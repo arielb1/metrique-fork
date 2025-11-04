@@ -16,9 +16,6 @@ use core::{
     ops::{Deref, DerefMut, Drop},
 };
 use std::sync::{Arc, Mutex, Weak};
-
-use tokio::sync::futures::OwnedNotified;
-
 /// [`Parent`] owner
 ///
 /// The [`Parent`] provides exclusive mutable access to its inner value.
@@ -39,98 +36,19 @@ unsafe impl<T> Send for Parent<T> where T: Send {}
 /// Safety: If `T` is `Sync`, then `Arc<T>` is `Sync`
 unsafe impl<T> Sync for Parent<T> where T: Sync {}
 
-/// Drop all and notification
-#[pin_project::pin_project]
-pub struct DropAllAndNotification {
-    drop_all: DropAll,
-    #[pin]
-    notification: OptOwnedNotified,
-}
-
-impl std::future::Future for DropAllAndNotification {
-    type Output = ();
-
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        let mut this = self.project();
-        loop {
-            match this.notification.as_mut().project() {
-                // slightly weird pattern to pin on first use
-                OptOwnedNotifiedProj::Unset => {
-                    match this.drop_all.0.upgrade() {
-                        Some(guard) => guard.notify(this.notification.as_mut()),
-                        // if this is already dead, set Done
-                        None => { this.notification.as_mut().set(OptOwnedNotified::Done); }
-                    }
-                }
-                OptOwnedNotifiedProj::Done => return std::task::Poll::Ready(()),
-                OptOwnedNotifiedProj::Notified(notified) => return notified.poll(cx)
-            }
-        }
-    }
-}
-
-#[pin_project::pin_project(project = OptOwnedNotifiedProj)]
-enum OptOwnedNotified {
-    Unset,
-    Done,
-    Notified(#[pin] tokio::sync::futures::OwnedNotified)
-}
-
-trait GuardInner: Send + Sync {
-    fn destroy(&self);
-    fn notify(&self, notified: std::pin::Pin<&mut OptOwnedNotified<>>);
-}
-
-struct GuardInnerStruct<F: FnOnce() + Send + Sync> {
-    destroy: F,
-    notify: Option<Arc<tokio::sync::Notify>>,
-}
-
-impl<F: FnOnce() + Send + Sync> GuardInnerStruct<F> {
-
-    fn new(f: F) -> Self {
-        Self { destroy: f, notify: None }
-    }
-}
-
 // Why all these layers?
 // They exist to make `DropAll` possible. We want to have a single switch to make all of the existing guards
 // release their handle on `Parent` to allow the inner value to Drop.
 //
 // 1. Mutex: This is inside an Arc. We need to be able to take the function out of the
 // 2. Option: Allow taking ownership of the:
-impl<F: FnOnce() + Send + Sync> GuardInner for Mutex<Option<GuardInnerStruct<F>>> {
-    fn destroy(&self) {
-        let mut guard = self.lock().unwrap();
-        if let Some(inner) = guard.take() {
-            (inner.destroy)();
-            if let Some(notify) = inner.notify {
-                notify.notify_waiters();
-            }
-        }
-    }
-
-    fn notify(&self, mut notified: std::pin::Pin<&mut OptOwnedNotified<>>) {
-        let mut guard = self.lock().unwrap();
-        if let Some(inner) = &mut *guard {
-            let notified_owned = inner.notify.get_or_insert_default().clone().notified_owned();
-            notified.as_mut().set(OptOwnedNotified::Notified(notified_owned));
-            if let OptOwnedNotifiedProj::Notified(notified_owned) = notified.project() {
-                // enable while the lock is held
-                notified_owned.enable();
-            } else {
-                unreachable!()
-            }
-
-        } else {
-            notified.set(OptOwnedNotified::Done);
-        }
-    }
-}
+// 3. Box<dyn Fn Once()...>: Function pointer (which inside of it holds a reference to the main `Arc`)
+//    Why the Function pointer? It allows us to erase the generic in the guard.
+type GuardInner = Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>;
 
 /// Any guards that remain alive will prevent the `value` within `Parent` from being dropped
 pub(crate) struct Guard {
-    _value: Arc<dyn GuardInner>,
+    _value: Arc<GuardInner>,
 }
 
 /// If a `DropAll` is created, dropping the `DropAll` will effectively ignore the existence of all `Guards`.
@@ -138,19 +56,14 @@ pub(crate) struct Guard {
 /// Dropping a `DropAll` will cause `value` to drop if and only if the `Parent` has been dropped already.
 /// Keeping a `DropAll` alive will NOT prevent the `Parent` from being dropped, if it and all standard guards have
 /// already been dropped.
-pub(crate) struct DropAll(Weak<dyn GuardInner>);
+pub(crate) struct DropAll(Weak<GuardInner>);
 impl Drop for DropAll {
     fn drop(&mut self) {
         if let Some(guard) = self.0.upgrade() {
-            guard.destroy();
+            if let Some(f) = guard.lock().unwrap().take() {
+                (f)()
+            }
         }
-    }
-}
-
-impl DropAll {
-    /// With notification
-    pub fn with_notification(self) -> DropAllAndNotification {
-        DropAllAndNotification { drop_all: self, notification: OptOwnedNotified::Unset }
     }
 }
 
@@ -164,7 +77,7 @@ impl<T: Send + Sync + 'static> Parent<T> {
         unsafe impl<T> Sync for AssertSendSync<T> {}
         let guard_value = AssertSendSync(value.clone());
         let guard = Guard {
-            _value: Arc::new(Mutex::new(Some(GuardInnerStruct::new(|| drop(guard_value))))),
+            _value: Arc::new(Mutex::new(Some(Box::new(|| drop(guard_value))))),
         };
         Self { value, guard }
     }
