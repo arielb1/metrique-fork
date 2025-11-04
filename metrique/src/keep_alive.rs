@@ -58,6 +58,7 @@ impl std::future::Future for DropAllAndNotification {
                 OptOwnedNotifiedProj::Unset => {
                     match this.drop_all.0.upgrade() {
                         Some(guard) => guard.notify(this.notification.as_mut()),
+                        // if this is already dead, set Done
                         None => { this.notification.as_mut().set(OptOwnedNotified::Done); }
                     }
                 }
