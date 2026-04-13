@@ -122,3 +122,185 @@ fn test_background_queue_with_invalid_metric() {
         })
     );
 }
+
+struct VecEntry {
+    plugins: Vec<String>,
+}
+
+impl Entry for VecEntry {
+    fn write<'a>(&'a self, writer: &mut impl EntryWriter<'a>) {
+        writer.timestamp(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        writer.value("Plugins", &self.plugins);
+    }
+}
+
+#[test]
+fn test_vec_emits_json_array_in_emf() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    stream
+        .next(&VecEntry {
+            plugins: vec!["auth".into(), "logging".into(), "cache".into()],
+        })
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(
+        output["Plugins"],
+        serde_json::json!(["auth", "logging", "cache"])
+    );
+}
+
+#[test]
+fn test_empty_vec_emits_empty_array_in_emf() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    stream.next(&VecEntry { plugins: vec![] }).unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(output["Plugins"], serde_json::json!([]));
+}
+
+struct VecOptionEntry {
+    tags: Vec<Option<String>>,
+}
+
+impl Entry for VecOptionEntry {
+    fn write<'a>(&'a self, writer: &mut impl EntryWriter<'a>) {
+        writer.timestamp(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        writer.value("Tags", &self.tags);
+    }
+}
+
+#[test]
+fn test_vec_with_none_elements_skips_them_in_emf() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    stream
+        .next(&VecOptionEntry {
+            tags: vec![Some("a".into()), None, Some("c".into())],
+        })
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(output["Tags"], serde_json::json!(["a", "c"]));
+}
+
+#[test]
+fn test_single_element_vec_in_emf() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    stream
+        .next(&VecEntry {
+            plugins: vec!["only".into()],
+        })
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(output["Plugins"], serde_json::json!(["only"]));
+}
+
+#[test]
+fn test_vec_emits_json_array_through_boxed_entry() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    let boxed = VecEntry {
+        plugins: vec!["a".into(), "b".into()],
+    }
+    .boxed();
+    stream.next(&boxed).unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(output["Plugins"], serde_json::json!(["a", "b"]));
+}
+
+struct VecU64Entry {
+    counts: Vec<u64>,
+}
+
+impl Entry for VecU64Entry {
+    fn write<'a>(&'a self, writer: &mut impl EntryWriter<'a>) {
+        writer.timestamp(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        writer.value("Counts", &self.counts);
+    }
+}
+
+#[test]
+fn test_vec_u64_emits_json_array_in_emf() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    stream
+        .next(&VecU64Entry {
+            counts: vec![10, 20, 30],
+        })
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(output["Counts"], serde_json::json!([10, 20, 30]));
+}
+
+#[test]
+fn test_single_u64_vec_in_emf() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    stream.next(&VecU64Entry { counts: vec![42] }).unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(output["Counts"], serde_json::json!([42]));
+}
+
+#[test]
+fn test_empty_u64_vec_in_emf() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    stream.next(&VecU64Entry { counts: vec![] }).unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(output["Counts"], serde_json::json!([]));
+}
+
+/// A custom Value that emits multiple observations, exercising the nested
+/// sub-array path in EmfArrayElementWriter::metric().
+struct MultiObsValue(Vec<u64>);
+
+impl metrique_writer_core::Value for MultiObsValue {
+    fn write(&self, writer: impl metrique_writer_core::ValueWriter) {
+        writer.metric(
+            self.0
+                .iter()
+                .map(|&v| metrique_writer_core::Observation::Unsigned(v)),
+            metrique_writer_core::Unit::None,
+            [],
+            metrique_writer_core::MetricFlags::empty(),
+        );
+    }
+}
+
+struct VecMultiObsEntry {
+    data: Vec<MultiObsValue>,
+}
+
+impl Entry for VecMultiObsEntry {
+    fn write<'a>(&'a self, writer: &mut impl EntryWriter<'a>) {
+        writer.timestamp(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        writer.value("Data", &self.data);
+    }
+}
+
+#[test]
+fn test_vec_multi_observation_nests_sub_arrays_in_emf() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    stream
+        .next(&VecMultiObsEntry {
+            data: vec![MultiObsValue(vec![1, 2, 3]), MultiObsValue(vec![4, 5])],
+        })
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(output["Data"], serde_json::json!([[1, 2, 3], [4, 5]]));
+}
+
+#[test]
+fn test_vec_single_observation_stays_scalar_in_emf() {
+    let sink = TestSink::default();
+    let mut stream = Emf::all_validations("App".into(), vec![vec![]]).output_to(sink.clone());
+    stream
+        .next(&VecMultiObsEntry {
+            data: vec![MultiObsValue(vec![10]), MultiObsValue(vec![20])],
+        })
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&sink.dump()).unwrap();
+    assert_json_diff::assert_json_eq!(output["Data"], serde_json::json!([10, 20]));
+}
